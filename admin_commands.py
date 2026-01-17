@@ -276,7 +276,7 @@ async def admin_view_pending(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
 async def admin_approve_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Approve screenshot"""
+    """Approve screenshot - from inline button"""
     query = update.callback_query
     await query.answer()
     
@@ -284,30 +284,41 @@ async def admin_approve_screenshot(update: Update, context: ContextTypes.DEFAULT
         await query.message.reply_text("❌ Unauthorized!")
         return
     
-    transaction_id = int(query.data.split('_')[1])
+    # Parse callback data: approve_userid_packageid_fileid
+    parts = query.data.split('_')
+    user_id = int(parts[1])
+    package_id = int(parts[2])
     
-    transaction = supabase.table('pending_transactions').select('*').eq('id', transaction_id).execute().data[0]
-    package = supabase.table('packages').select('*').eq('id', transaction['package_id']).execute().data[0]
+    # Find the pending transaction
+    pending = supabase.table('pending_transactions').select('*').eq('user_id', user_id).eq('package_id', package_id).eq('status', 'pending').execute().data
     
+    if not pending:
+        await query.message.reply_text("❌ Transaction not found or already processed!")
+        return
+    
+    transaction = pending[0]
+    package = supabase.table('packages').select('*').eq('id', package_id).execute().data[0]
+    
+    # Generate token
     token_id = secrets.token_hex(16)
-    
     token_data = {
         'token_id': token_id,
-        'user_id': transaction['user_id'],
+        'user_id': user_id,
         'username': transaction['username'],
-        'package_id': transaction['package_id'],
-        'transaction_id': f"SS_{transaction_id}",
+        'package_id': package_id,
+        'transaction_id': f"SS_{transaction['id']}",
         'amount': package['amount'],
         'status': 'active',
         'created_at': datetime.utcnow().isoformat()
     }
     supabase.table('tokens').insert(token_data).execute()
     
+    # Generate key immediately
     key = secrets.token_urlsafe(32)
     key_data = {
         'key': key,
-        'user_id': transaction['user_id'],
-        'package_id': transaction['package_id'],
+        'user_id': user_id,
+        'package_id': package_id,
         'token_id': token_id,
         'validity_days': package['validity'],
         'status': 'active',
@@ -316,20 +327,22 @@ async def admin_approve_screenshot(update: Update, context: ContextTypes.DEFAULT
     supabase.table('keys').insert(key_data).execute()
     supabase.table('tokens').update({'status': 'used'}).eq('token_id', token_id).execute()
     
+    # Mark as approved
     supabase.table('pending_transactions').update({
         'status': 'approved',
         'reviewed_at': datetime.utcnow().isoformat(),
         'reviewed_by': update.effective_user.id
-    }).eq('id', transaction_id).execute()
+    }).eq('id', transaction['id']).execute()
     
+    # Notify user
     try:
         await context.bot.send_message(
-            chat_id=transaction['user_id'],
+            chat_id=user_id,
             text=(
                 f"✅ *Payment Approved!*\n\n"
                 f"📦 Package: {package['plan_name']}\n"
                 f"⏱ Validity: {package['validity']} days\n\n"
-                f"🔐 Your Key:\n`{key}`\n\n"
+                f"🔐 *Your Key:*\n`{key}`\n\n"
                 f"⚠️ Keep this key safe!"
             ),
             parse_mode='Markdown'
@@ -337,13 +350,14 @@ async def admin_approve_screenshot(update: Update, context: ContextTypes.DEFAULT
     except:
         pass
     
+    # Update admin message
     await query.message.edit_caption(
         caption=query.message.caption + "\n\n✅ *APPROVED*",
         parse_mode='Markdown'
     )
 
 async def admin_reject_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reject screenshot"""
+    """Reject screenshot - from inline button"""
     query = update.callback_query
     await query.answer()
     
@@ -351,21 +365,34 @@ async def admin_reject_screenshot(update: Update, context: ContextTypes.DEFAULT_
         await query.message.reply_text("❌ Unauthorized!")
         return
     
-    transaction_id = int(query.data.split('_')[1])
-    transaction = supabase.table('pending_transactions').select('*').eq('id', transaction_id).execute().data[0]
+    # Parse callback data
+    parts = query.data.split('_')
+    user_id = int(parts[1])
+    package_id = int(parts[2])
     
+    # Find the pending transaction
+    pending = supabase.table('pending_transactions').select('*').eq('user_id', user_id).eq('package_id', package_id).eq('status', 'pending').execute().data
+    
+    if not pending:
+        await query.message.reply_text("❌ Transaction not found or already processed!")
+        return
+    
+    transaction = pending[0]
+    
+    # Mark as rejected
     supabase.table('pending_transactions').update({
         'status': 'rejected',
         'reviewed_at': datetime.utcnow().isoformat(),
         'reviewed_by': update.effective_user.id
-    }).eq('id', transaction_id).execute()
+    }).eq('id', transaction['id']).execute()
     
+    # Notify user
     try:
         await context.bot.send_message(
-            chat_id=transaction['user_id'],
+            chat_id=user_id,
             text=(
                 "❌ *Payment Rejected*\n\n"
-                "Your payment screenshot has been rejected.\n"
+                "Your payment screenshot was rejected.\n"
                 "Please contact admin for more details."
             ),
             parse_mode='Markdown'
@@ -373,6 +400,7 @@ async def admin_reject_screenshot(update: Update, context: ContextTypes.DEFAULT_
     except:
         pass
     
+    # Update admin message
     await query.message.edit_caption(
         caption=query.message.caption + "\n\n❌ *REJECTED*",
         parse_mode='Markdown'
