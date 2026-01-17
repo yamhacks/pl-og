@@ -28,7 +28,7 @@ SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Conversation states
-WAITING_TOKEN, WAITING_TXN_ID = range(2)
+WAITING_TOKEN, WAITING_PAYMENT_PROOF = range(2)
 
 # Helper functions
 def get_bot_settings():
@@ -425,19 +425,20 @@ async def select_package_callback(update: Update, context: ContextTypes.DEFAULT_
             f"📱 *Payment Steps:*\n"
             f"1️⃣ Scan the QR code above\n"
             f"2️⃣ Or copy UPI ID and pay manually\n"
-            f"3️⃣ Complete payment in your UPI app\n"
-            f"4️⃣ Send Transaction ID/UTR here\n\n"
-            f"👇 After payment, send your Transaction ID"
+            f"3️⃣ Complete payment in your UPI app\n\n"
+            f"💡 *After Payment:*\n"
+            f"📤 Send Transaction ID/UTR (instant verification)\n"
+            f"📸 Or send payment screenshot (manual review)\n\n"
+            f"👇 Waiting for your payment proof..."
         ),
         parse_mode='Markdown',
         reply_markup=reply_markup
     )
     
-    return WAITING_TXN_ID
+    return WAITING_PAYMENT_PROOF
 
-async def receive_transaction_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive and verify transaction ID"""
-    txn_id = update.message.text.strip()
+async def receive_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive either transaction ID (text) or screenshot (photo)"""
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
     package_id = context.user_data.get('selected_package_id')
@@ -448,35 +449,118 @@ async def receive_transaction_id(update: Update, context: ContextTypes.DEFAULT_T
     
     package = get_package_by_id(package_id)
     
+    # Check if user sent a photo (screenshot)
+    if update.message.photo:
+        await handle_screenshot_submission(update, context, user_id, username, package_id, package)
+    # Check if user sent text (transaction ID)
+    elif update.message.text:
+        await handle_transaction_id_submission(update, context, user_id, username, package_id, package)
+    else:
+        await update.message.reply_text(
+            "❌ Please send either:\n"
+            "📤 Transaction ID/UTR (text)\n"
+            "📸 Payment screenshot (image)"
+        )
+        return WAITING_PAYMENT_PROOF
+    
+    return ConversationHandler.END
+
+async def handle_transaction_id_submission(update, context, user_id, username, package_id, package):
+    """Handle automatic transaction ID verification"""
+    txn_id = update.message.text.strip()
+    
     await update.message.reply_text("⏳ Verifying transaction...")
     
     result = verify_transaction(txn_id, package['amount'])
     
     if result['status'] == 'SUCCESS':
+        # Auto-generate token and key
         token_id = save_token(user_id, username, package_id, txn_id, package['amount'])
         
-        keyboard = [[InlineKeyboardButton("🔑 Generate Key Now", callback_data="generate_key")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        # Generate key immediately
+        key = secrets.token_urlsafe(32)
+        key_data = {
+            'key': key,
+            'user_id': user_id,
+            'package_id': package_id,
+            'token_id': token_id,
+            'validity_days': package['validity'],
+            'created_at': datetime.utcnow().isoformat(),
+            'status': 'active'
+        }
+        supabase.table('keys').insert(key_data).execute()
+        supabase.table('tokens').update({'status': 'used'}).eq('token_id', token_id).execute()
         
         await update.message.reply_text(
-            f"✅ *Transaction Verified!*\n\n"
+            f"✅ *Payment Verified & Approved!*\n\n"
             f"💰 Amount: ₹{result['amount']}\n"
             f"👤 Payer: {result['payer']}\n"
             f"📱 App: {result['app']}\n\n"
-            f"🎟 Your Token ID:\n`{token_id}`\n\n"
-            f"You can now generate your key!",
-            parse_mode='Markdown',
-            reply_markup=reply_markup
+            f"📦 Package: {package['plan_name']}\n"
+            f"⏱ Validity: {package['validity']} days\n\n"
+            f"🔐 *Your Key:*\n`{key}`\n\n"
+            f"⚠️ Keep this key safe!",
+            parse_mode='Markdown'
         )
     else:
         await update.message.reply_text(
-            f"❌ *Verification Failed!*\n\n"
+            f"❌ *Automatic Verification Failed!*\n\n"
             f"{result.get('message', 'Unknown error')}\n\n"
-            f"Please check and try again.",
+            f"💡 You can send payment screenshot instead for manual review.",
             parse_mode='Markdown'
         )
+
+async def handle_screenshot_submission(update, context, user_id, username, package_id, package):
+    """Handle manual screenshot review"""
+    photo = update.message.photo[-1]
+    file_id = photo.file_id
     
-    return ConversationHandler.END
+    # Save to pending transactions
+    pending_data = {
+        'user_id': user_id,
+        'username': username,
+        'package_id': package_id,
+        'screenshot_file_id': file_id,
+        'status': 'pending',
+        'created_at': datetime.utcnow().isoformat()
+    }
+    supabase.table('pending_transactions').insert(pending_data).execute()
+    
+    await update.message.reply_text(
+        "✅ *Screenshot Received!*\n\n"
+        "Your payment is under review.\n"
+        "⏱ Review time: 1-2 hours\n\n"
+        "You will receive your key once approved by admin.",
+        parse_mode='Markdown'
+    )
+    
+    # Notify all admins
+    admins = get_all_admins()
+    
+    for admin_id in admins:
+        try:
+            keyboard = [
+                [InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user_id}_{package_id}_{file_id}")],
+                [InlineKeyboardButton("❌ Reject", callback_data=f"reject_{user_id}_{package_id}_{file_id}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await context.bot.send_photo(
+                chat_id=admin_id,
+                photo=file_id,
+                caption=(
+                    f"📸 *New Payment Screenshot*\n\n"
+                    f"👤 User: @{username}\n"
+                    f"🆔 User ID: `{user_id}`\n"
+                    f"📦 Package: {package['plan_name']}\n"
+                    f"💰 Amount: ₹{package['amount']}\n"
+                    f"⏱ Validity: {package['validity']} days"
+                ),
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify admin {admin_id}: {e}")
 
 async def back_to_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Back to main menu"""
@@ -501,7 +585,9 @@ def main():
         ],
         states={
             WAITING_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_token)],
-            WAITING_TXN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_transaction_id)]
+            WAITING_PAYMENT_PROOF: [
+                MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), receive_payment_proof)
+            ]
         },
         fallbacks=[
             CommandHandler('cancel', cancel),
