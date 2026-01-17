@@ -28,7 +28,7 @@ SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Conversation states
-WAITING_TOKEN, WAITING_SCREENSHOT, WAITING_TXN_ID = range(3)
+WAITING_TOKEN, WAITING_TXN_ID = range(2)
 
 # Helper functions
 def get_bot_settings():
@@ -104,19 +104,6 @@ async def notify_admins_new_user(context, user_id, username, first_name):
             )
         except Exception as e:
             logger.error(f"Failed to notify admin {admin_id}: {e}")
-
-def save_pending_transaction(user_id, username, package_id, screenshot_file_id=None):
-    """Save pending transaction"""
-    data = {
-        'user_id': user_id,
-        'username': username,
-        'package_id': package_id,
-        'screenshot_file_id': screenshot_file_id,
-        'status': 'pending',
-        'created_at': datetime.utcnow().isoformat()
-    }
-    result = supabase.table('pending_transactions').insert(data).execute()
-    return result.data[0] if result.data else None
 
 def generate_token_id():
     """Generate unique token ID"""
@@ -199,7 +186,7 @@ def verify_transaction(transaction_id, expected_amount):
 
 # Bot handlers
 async def check_channel_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check if user is member of required channel - IMPROVED VERSION"""
+    """Check if user is member of required channel"""
     settings = get_bot_settings()
     
     if not settings or not settings.get('force_channel'):
@@ -214,22 +201,12 @@ async def check_channel_membership(update: Update, context: ContextTypes.DEFAULT
     except Exception as e:
         error_msg = str(e)
         
-        # Better error handling
         if "Chat not found" in error_msg:
             logger.error(f"❌ Channel Error: '{channel}' not found!")
-            logger.error("💡 Solutions:")
-            logger.error("   1. Make sure bot is ADDED to the channel as ADMIN")
-            logger.error("   2. For private channels: Use channel ID (like -100123456789)")
-            logger.error("   3. For public channels: Use @channelname format")
-            logger.error("   4. Check channel username is correct")
-            # Return True to not block users when channel is misconfigured
+            logger.error("💡 Make sure bot is ADDED to the channel as ADMIN")
             return True
-        elif "Bad Request: user not found" in error_msg:
-            # User doesn't exist - should not happen but handle it
-            return False
         else:
             logger.error(f"Channel membership check error: {error_msg}")
-            # Return True to not block users on temporary errors
             return True
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -259,7 +236,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 channel_username = channel.replace('@', '')
                 join_url = f"https://t.me/{channel_username}"
             elif channel.startswith('-100'):
-                # Private channel - can't generate direct link
                 join_url = None
             else:
                 channel_username = channel
@@ -270,7 +246,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if join_url:
                 keyboard.append([InlineKeyboardButton("📢 Join Channel", url=join_url)])
             else:
-                # For private channels without link
                 await update.message.reply_text(
                     f"🚫 *Access Denied!*\n\n"
                     f"Please join our channel: `{channel}`\n\n"
@@ -394,7 +369,7 @@ async def buy_package_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 async def select_package_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Package selection callback"""
+    """Package selection callback - SIMPLIFIED FLOW"""
     query = update.callback_query
     await query.answer()
     
@@ -405,7 +380,7 @@ async def select_package_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.message.reply_text("❌ Package not found!")
         return
     
-    context.user_data['selected_package'] = package
+    context.user_data['selected_package_id'] = package_id
     
     upi_details = get_upi_details()
     
@@ -426,6 +401,13 @@ async def select_package_callback(update: Update, context: ContextTypes.DEFAULT_
     img.save(bio, 'PNG')
     bio.seek(0)
     
+    # Send QR code with Pay Now button
+    keyboard = [
+        [InlineKeyboardButton("💳 Pay Now", url=upi_string)],
+        [InlineKeyboardButton("« Back", callback_data="buy_package")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     await query.message.reply_photo(
         photo=InputFile(bio, filename='qr.png'),
         caption=(
@@ -434,36 +416,13 @@ async def select_package_callback(update: Update, context: ContextTypes.DEFAULT_
             f"⏱ Validity: {package['validity']} days\n"
             f"📝 Description: {package['description']}\n\n"
             f"💳 UPI ID: `{upi_details['upi_id']}`\n\n"
-            f"Scan QR code or pay using UPI ID."
+            f"1️⃣ Click 'Pay Now' button\n"
+            f"2️⃣ Complete payment in your UPI app\n"
+            f"3️⃣ Send transaction ID here\n\n"
+            f"👇 After payment, send your Transaction ID/UTR number"
         ),
-        parse_mode='Markdown'
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton("💳 Pay Now", url=upi_string)],
-        [InlineKeyboardButton("✅ Submit Transaction ID", callback_data=f"submit_txn_{package_id}")],
-        [InlineKeyboardButton("📸 Submit Screenshot", callback_data=f"submit_ss_{package_id}")],
-        [InlineKeyboardButton("« Back", callback_data="buy_package")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.message.reply_text(
-        "Select an option:",
+        parse_mode='Markdown',
         reply_markup=reply_markup
-    )
-
-async def submit_transaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Submit transaction ID"""
-    query = update.callback_query
-    await query.answer()
-    
-    package_id = int(query.data.split('_')[2])
-    context.user_data['pending_package_id'] = package_id
-    
-    await query.message.reply_text(
-        "🔢 *Submit Transaction ID*\n\n"
-        "Please enter your UTR/Transaction ID:",
-        parse_mode='Markdown'
     )
     
     return WAITING_TXN_ID
@@ -473,7 +432,7 @@ async def receive_transaction_id(update: Update, context: ContextTypes.DEFAULT_T
     txn_id = update.message.text.strip()
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
-    package_id = context.user_data.get('pending_package_id')
+    package_id = context.user_data.get('selected_package_id')
     
     if not package_id:
         await update.message.reply_text("❌ Error: Package not found!")
@@ -511,73 +470,6 @@ async def receive_transaction_id(update: Update, context: ContextTypes.DEFAULT_T
     
     return ConversationHandler.END
 
-async def submit_screenshot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Submit screenshot"""
-    query = update.callback_query
-    await query.answer()
-    
-    package_id = int(query.data.split('_')[2])
-    context.user_data['pending_package_id'] = package_id
-    
-    await query.message.reply_text(
-        "📸 *Submit Screenshot*\n\n"
-        "Please upload payment screenshot.\n"
-        "⏱ Review time: 1-2 hours",
-        parse_mode='Markdown'
-    )
-    
-    return WAITING_SCREENSHOT
-
-async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive screenshot"""
-    user_id = update.effective_user.id
-    username = update.effective_user.username or "Unknown"
-    package_id = context.user_data.get('pending_package_id')
-    
-    if not update.message.photo:
-        await update.message.reply_text("❌ Please send screenshot image!")
-        return WAITING_SCREENSHOT
-    
-    photo = update.message.photo[-1]
-    file_id = photo.file_id
-    
-    save_pending_transaction(user_id, username, package_id, file_id)
-    
-    await update.message.reply_text(
-        "✅ *Screenshot Received!*\n\n"
-        "Your request has been sent to admin for review.\n"
-        "⏱ Review time: 1-2 hours\n\n"
-        "You will receive your key once approved.",
-        parse_mode='Markdown'
-    )
-    
-    # Notify all admins
-    admins = get_all_admins()
-    package = get_package_by_id(package_id)
-    
-    keyboard = [[InlineKeyboardButton("Approve ✅", callback_data=f"approve_{user_id}_{package_id}_{file_id}")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    for admin_id in admins:
-        try:
-            await context.bot.send_photo(
-                chat_id=admin_id,
-                photo=file_id,
-                caption=(
-                    f"📝 *New Payment Screenshot*\n\n"
-                    f"👤 User: @{username}\n"
-                    f"🆔 User ID: `{user_id}`\n"
-                    f"📦 Package: {package['plan_name']}\n"
-                    f"💰 Amount: ₹{package['amount']}"
-                ),
-                parse_mode='Markdown',
-                reply_markup=reply_markup
-            )
-        except Exception as e:
-            logger.error(f"Failed to notify admin {admin_id}: {e}")
-    
-    return ConversationHandler.END
-
 async def back_to_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Back to main menu"""
     query = update.callback_query
@@ -593,24 +485,26 @@ def main():
     """Start bot"""
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
+    # Main conversation handler
     conv_handler = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(generate_key_callback, pattern="^generate_key$"),
-            CallbackQueryHandler(submit_transaction_callback, pattern="^submit_txn_"),
-            CallbackQueryHandler(submit_screenshot_callback, pattern="^submit_ss_")
+            CallbackQueryHandler(select_package_callback, pattern="^select_pkg_")
         ],
         states={
             WAITING_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_token)],
-            WAITING_TXN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_transaction_id)],
-            WAITING_SCREENSHOT: [MessageHandler(filters.PHOTO, receive_screenshot)]
+            WAITING_TXN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_transaction_id)]
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            CallbackQueryHandler(buy_package_callback, pattern="^buy_package$"),
+            CallbackQueryHandler(back_to_menu_callback, pattern="^back_to_menu$")
+        ]
     )
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(verify_callback, pattern="^verify_membership$"))
     application.add_handler(CallbackQueryHandler(buy_package_callback, pattern="^buy_package$"))
-    application.add_handler(CallbackQueryHandler(select_package_callback, pattern="^select_pkg_"))
     application.add_handler(CallbackQueryHandler(back_to_menu_callback, pattern="^back_to_menu$"))
     application.add_handler(conv_handler)
     
