@@ -193,7 +193,11 @@ async def check_channel_membership(update: Update, context: ContextTypes.DEFAULT
         return True
     
     user_id = update.effective_user.id
-    channel = settings['force_channel']
+    channel = settings['force_channel'].strip()
+    
+    # Remove @ if present in channel ID (IDs should not have @)
+    if channel.startswith('@-'):
+        channel = channel[1:]  # Remove the @ from @-100...
     
     try:
         member = await context.bot.get_chat_member(channel, user_id)
@@ -204,6 +208,8 @@ async def check_channel_membership(update: Update, context: ContextTypes.DEFAULT
         if "Chat not found" in error_msg:
             logger.error(f"❌ Channel Error: '{channel}' not found!")
             logger.error("💡 Make sure bot is ADDED to the channel as ADMIN")
+            logger.error("💡 For channel IDs: Use -100123456789 (WITHOUT @)")
+            logger.error("💡 For usernames: Use @channelname")
             return True
         else:
             logger.error(f"Channel membership check error: {error_msg}")
@@ -401,9 +407,8 @@ async def select_package_callback(update: Update, context: ContextTypes.DEFAULT_
     img.save(bio, 'PNG')
     bio.seek(0)
     
-    # Send QR code with Pay Now button
+    # Send QR code without deep link button (Telegram doesn't support upi://)
     keyboard = [
-        [InlineKeyboardButton("💳 Pay Now", url=upi_string)],
         [InlineKeyboardButton("« Back", callback_data="buy_package")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -415,11 +420,14 @@ async def select_package_callback(update: Update, context: ContextTypes.DEFAULT_
             f"💰 Amount: ₹{package['amount']}\n"
             f"⏱ Validity: {package['validity']} days\n"
             f"📝 Description: {package['description']}\n\n"
-            f"💳 UPI ID: `{upi_details['upi_id']}`\n\n"
-            f"1️⃣ Click 'Pay Now' button\n"
-            f"2️⃣ Complete payment in your UPI app\n"
-            f"3️⃣ Send transaction ID here\n\n"
-            f"👇 After payment, send your Transaction ID/UTR number"
+            f"💳 UPI ID: `{upi_details['upi_id']}`\n"
+            f"👤 Name: {upi_details['name']}\n\n"
+            f"📱 *Payment Steps:*\n"
+            f"1️⃣ Scan the QR code above\n"
+            f"2️⃣ Or copy UPI ID and pay manually\n"
+            f"3️⃣ Complete payment in your UPI app\n"
+            f"4️⃣ Send Transaction ID/UTR here\n\n"
+            f"👇 After payment, send your Transaction ID"
         ),
         parse_mode='Markdown',
         reply_markup=reply_markup
