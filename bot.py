@@ -84,7 +84,7 @@ def save_user(user_id, username, first_name, last_name=None):
     else:
         supabase.table('users').insert(data).execute()
 
-def notify_admins_new_user(context, user_id, username, first_name):
+async def notify_admins_new_user(context, user_id, username, first_name):
     """Notify all admins about new user"""
     admins = get_all_admins()
     message = (
@@ -97,7 +97,7 @@ def notify_admins_new_user(context, user_id, username, first_name):
     
     for admin_id in admins:
         try:
-            context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=admin_id,
                 text=message,
                 parse_mode='Markdown'
@@ -199,7 +199,7 @@ def verify_transaction(transaction_id, expected_amount):
 
 # Bot handlers
 async def check_channel_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check if user is member of required channel"""
+    """Check if user is member of required channel - IMPROVED VERSION"""
     settings = get_bot_settings()
     
     if not settings or not settings.get('force_channel'):
@@ -212,8 +212,25 @@ async def check_channel_membership(update: Update, context: ContextTypes.DEFAULT
         member = await context.bot.get_chat_member(channel, user_id)
         return member.status in ['member', 'administrator', 'creator']
     except Exception as e:
-        logger.error(f"Channel check error: {e}")
-        return False
+        error_msg = str(e)
+        
+        # Better error handling
+        if "Chat not found" in error_msg:
+            logger.error(f"❌ Channel Error: '{channel}' not found!")
+            logger.error("💡 Solutions:")
+            logger.error("   1. Make sure bot is ADDED to the channel as ADMIN")
+            logger.error("   2. For private channels: Use channel ID (like -100123456789)")
+            logger.error("   3. For public channels: Use @channelname format")
+            logger.error("   4. Check channel username is correct")
+            # Return True to not block users when channel is misconfigured
+            return True
+        elif "Bad Request: user not found" in error_msg:
+            # User doesn't exist - should not happen but handle it
+            return False
+        else:
+            logger.error(f"Channel membership check error: {error_msg}")
+            # Return True to not block users on temporary errors
+            return True
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command handler"""
@@ -235,16 +252,39 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_member = await check_channel_membership(update, context)
         
         if not is_member:
-            channel_username = settings['force_channel'].replace('@', '')
-            keyboard = [
-                [InlineKeyboardButton("Join Channel 🔗", url=f"https://t.me/{channel_username}")],
-                [InlineKeyboardButton("Verify ✅", callback_data="verify_membership")]
-            ]
+            channel = settings['force_channel']
+            
+            # Handle both username and ID formats
+            if channel.startswith('@'):
+                channel_username = channel.replace('@', '')
+                join_url = f"https://t.me/{channel_username}"
+            elif channel.startswith('-100'):
+                # Private channel - can't generate direct link
+                join_url = None
+            else:
+                channel_username = channel
+                join_url = f"https://t.me/{channel_username}"
+            
+            keyboard = []
+            
+            if join_url:
+                keyboard.append([InlineKeyboardButton("📢 Join Channel", url=join_url)])
+            else:
+                # For private channels without link
+                await update.message.reply_text(
+                    f"🚫 *Access Denied!*\n\n"
+                    f"Please join our channel: `{channel}`\n\n"
+                    f"Contact admin for channel link.",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            keyboard.append([InlineKeyboardButton("✅ I Joined, Verify", callback_data="verify_membership")])
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             await update.message.reply_text(
                 f"🚫 *Access Denied!*\n\n"
-                f"Please join our channel first.\n\n"
+                f"Please join our channel first: {channel}\n\n"
                 f"After joining, click 'Verify' button.",
                 parse_mode='Markdown',
                 reply_markup=reply_markup
@@ -524,7 +564,7 @@ async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 chat_id=admin_id,
                 photo=file_id,
                 caption=(
-                    f"🔔 *New Payment Screenshot*\n\n"
+                    f"📝 *New Payment Screenshot*\n\n"
                     f"👤 User: @{username}\n"
                     f"🆔 User ID: `{user_id}`\n"
                     f"📦 Package: {package['plan_name']}\n"
@@ -580,6 +620,19 @@ def main():
         application.add_handler(handler)
     
     logger.info("Bot starting...")
+    logger.info("=" * 60)
+    logger.info("📢 CHANNEL SETUP GUIDE:")
+    logger.info("=" * 60)
+    logger.info("For PUBLIC channels:")
+    logger.info("  1. Add bot to channel as ADMIN")
+    logger.info("  2. Set channel username in bot_settings: @channelname")
+    logger.info("")
+    logger.info("For PRIVATE channels:")
+    logger.info("  1. Add bot to channel as ADMIN")
+    logger.info("  2. Get channel ID (forward message from channel to @userinfobot)")
+    logger.info("  3. Set channel ID in bot_settings: -100123456789")
+    logger.info("=" * 60)
+    
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
