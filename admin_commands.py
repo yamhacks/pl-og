@@ -1,6 +1,9 @@
 """
-Admin Commands Module
-Complete admin panel for bot management with Limited Admin support
+Admin Commands Module - FIXED VERSION
+Fixes:
+1. Transaction ID reuse prevention
+2. Approve/Reject buttons working properly
+3. Buttons disabled after action
 """
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -41,8 +44,20 @@ def is_super_admin(user_id):
     """Check if user is super admin"""
     return get_admin_role(user_id) == 'super'
 
+def is_transaction_used(transaction_id):
+    """Check if transaction ID is already used"""
+    result = supabase.table('tokens').select('transaction_id').eq('transaction_id', transaction_id).execute()
+    return len(result.data) > 0 if result.data else False
+
 def verify_transaction(transaction_id, expected_amount):
     """Verify transaction via API"""
+    # FIRST: Check if transaction ID already used
+    if is_transaction_used(transaction_id):
+        return {
+            'status': 'FAILED',
+            'message': 'This Transaction ID has already been used!'
+        }
+    
     settings = supabase.table('bot_settings').select('*').limit(1).execute().data
     
     if not settings or not settings[0].get('api_token'):
@@ -82,7 +97,6 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = get_admin_role(user_id)
     
     if role == 'limited':
-        # Limited admin menu
         keyboard = [
             [InlineKeyboardButton("➕ Generate Token Manually", callback_data="admin_gen_token")],
             [InlineKeyboardButton("📋 View Pending Reviews", callback_data="admin_pending")],
@@ -91,12 +105,11 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
-            "🔐 *Limited Admin Panel*\n\nSelect an option:",
+            "🔓 *Limited Admin Panel*\n\nSelect an option:",
             parse_mode='Markdown',
             reply_markup=reply_markup
         )
     else:
-        # Super admin menu
         keyboard = [
             [InlineKeyboardButton("➕ Generate Token Manually", callback_data="admin_gen_token")],
             [InlineKeyboardButton("📋 View Pending Reviews", callback_data="admin_pending")],
@@ -276,7 +289,7 @@ async def admin_view_pending(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
 async def admin_approve_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Approve screenshot - from inline button"""
+    """Approve screenshot - FIXED VERSION"""
     query = update.callback_query
     await query.answer()
     
@@ -284,19 +297,27 @@ async def admin_approve_screenshot(update: Update, context: ContextTypes.DEFAULT
         await query.message.reply_text("❌ Unauthorized!")
         return
     
-    # Parse callback data: approve_userid_packageid_fileid
-    parts = query.data.split('_')
-    user_id = int(parts[1])
-    package_id = int(parts[2])
+    # Parse callback data: approve_TRANSACTION_ID
+    try:
+        transaction_id = int(query.data.split('_')[1])
+    except:
+        await query.message.reply_text("❌ Invalid transaction ID!")
+        return
     
     # Find the pending transaction
-    pending = supabase.table('pending_transactions').select('*').eq('user_id', user_id).eq('package_id', package_id).eq('status', 'pending').execute().data
+    pending = supabase.table('pending_transactions').select('*').eq('id', transaction_id).eq('status', 'pending').execute().data
     
     if not pending:
-        await query.message.reply_text("❌ Transaction not found or already processed!")
+        await query.answer("❌ Already processed!", show_alert=True)
+        await query.message.edit_caption(
+            caption=query.message.caption + "\n\n⚠️ *ALREADY PROCESSED*",
+            parse_mode='Markdown'
+        )
         return
     
     transaction = pending[0]
+    user_id = transaction['user_id']
+    package_id = transaction['package_id']
     package = supabase.table('packages').select('*').eq('id', package_id).execute().data[0]
     
     # Generate token
@@ -342,7 +363,7 @@ async def admin_approve_screenshot(update: Update, context: ContextTypes.DEFAULT
                 f"✅ *Payment Approved!*\n\n"
                 f"📦 Package: {package['plan_name']}\n"
                 f"⏱ Validity: {package['validity']} days\n\n"
-                f"🔐 *Your Key:*\n`{key}`\n\n"
+                f"🔑 *Your Key:*\n`{key}`\n\n"
                 f"⚠️ Keep this key safe!"
             ),
             parse_mode='Markdown'
@@ -350,14 +371,16 @@ async def admin_approve_screenshot(update: Update, context: ContextTypes.DEFAULT
     except:
         pass
     
-    # Update admin message
+    # Update admin message - REMOVE BUTTONS
     await query.message.edit_caption(
-        caption=query.message.caption + "\n\n✅ *APPROVED*",
+        caption=query.message.caption + f"\n\n✅ *APPROVED by Admin {update.effective_user.id}*",
         parse_mode='Markdown'
     )
+    
+    await query.answer("✅ Approved successfully!", show_alert=True)
 
 async def admin_reject_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reject screenshot - from inline button"""
+    """Reject screenshot - FIXED VERSION"""
     query = update.callback_query
     await query.answer()
     
@@ -365,19 +388,26 @@ async def admin_reject_screenshot(update: Update, context: ContextTypes.DEFAULT_
         await query.message.reply_text("❌ Unauthorized!")
         return
     
-    # Parse callback data
-    parts = query.data.split('_')
-    user_id = int(parts[1])
-    package_id = int(parts[2])
+    # Parse callback data: reject_TRANSACTION_ID
+    try:
+        transaction_id = int(query.data.split('_')[1])
+    except:
+        await query.message.reply_text("❌ Invalid transaction ID!")
+        return
     
     # Find the pending transaction
-    pending = supabase.table('pending_transactions').select('*').eq('user_id', user_id).eq('package_id', package_id).eq('status', 'pending').execute().data
+    pending = supabase.table('pending_transactions').select('*').eq('id', transaction_id).eq('status', 'pending').execute().data
     
     if not pending:
-        await query.message.reply_text("❌ Transaction not found or already processed!")
+        await query.answer("❌ Already processed!", show_alert=True)
+        await query.message.edit_caption(
+            caption=query.message.caption + "\n\n⚠️ *ALREADY PROCESSED*",
+            parse_mode='Markdown'
+        )
         return
     
     transaction = pending[0]
+    user_id = transaction['user_id']
     
     # Mark as rejected
     supabase.table('pending_transactions').update({
@@ -400,11 +430,13 @@ async def admin_reject_screenshot(update: Update, context: ContextTypes.DEFAULT_
     except:
         pass
     
-    # Update admin message
+    # Update admin message - REMOVE BUTTONS
     await query.message.edit_caption(
-        caption=query.message.caption + "\n\n❌ *REJECTED*",
+        caption=query.message.caption + f"\n\n❌ *REJECTED by Admin {update.effective_user.id}*",
         parse_mode='Markdown'
     )
+    
+    await query.answer("❌ Rejected!", show_alert=True)
 
 # === PACKAGE MANAGEMENT (SUPER ADMIN ONLY) ===
 async def admin_packages_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -696,14 +728,14 @@ async def admin_add_admin_id(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
         keyboard = [
             [InlineKeyboardButton("🔑 Super Admin", callback_data="role_super")],
-            [InlineKeyboardButton("🔐 Limited Admin", callback_data="role_limited")]
+            [InlineKeyboardButton("🔓 Limited Admin", callback_data="role_limited")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
             f"Select admin role:\n\n"
             f"🔑 *Super Admin* - Full access\n"
-            f"🔐 *Limited Admin* - Only generate tokens & review",
+            f"🔓 *Limited Admin* - Only generate tokens & review",
             parse_mode='Markdown',
             reply_markup=reply_markup
         )
@@ -813,10 +845,8 @@ async def admin_edit_channel_save(update: Update, context: ContextTypes.DEFAULT_
     
     # Handle channel ID vs username
     if channel.startswith('-100'):
-        # It's a channel ID, don't add @
         channel = channel
     elif not channel.startswith('@'):
-        # It's a username without @, add it
         channel = '@' + channel
     
     settings = supabase.table('bot_settings').select('*').limit(1).execute().data
@@ -890,7 +920,7 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👥 Total Users: {total_users}\n"
         f"🎟 Total Tokens: {total_tokens}\n"
         f"✅ Active Tokens: {active_tokens}\n"
-        f"🔐 Total Keys: {total_keys}\n"
+        f"🔑 Total Keys: {total_keys}\n"
         f"⏳ Pending Reviews: {pending_reviews}"
     )
     
@@ -909,7 +939,6 @@ async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = get_admin_role(user_id)
     
     if role == 'limited':
-        # Limited admin menu
         keyboard = [
             [InlineKeyboardButton("➕ Generate Token Manually", callback_data="admin_gen_token")],
             [InlineKeyboardButton("📋 View Pending Reviews", callback_data="admin_pending")],
@@ -918,12 +947,11 @@ async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.message.edit_text(
-            "🔐 *Limited Admin Panel*\n\nSelect an option:",
+            "🔓 *Limited Admin Panel*\n\nSelect an option:",
             parse_mode='Markdown',
             reply_markup=reply_markup
         )
     else:
-        # Super admin menu
         keyboard = [
             [InlineKeyboardButton("➕ Generate Token Manually", callback_data="admin_gen_token")],
             [InlineKeyboardButton("📋 View Pending Reviews", callback_data="admin_pending")],
