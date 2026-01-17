@@ -154,8 +154,20 @@ def generate_key(token_id, user_id):
     
     return key
 
+def is_transaction_used(transaction_id):
+    """Check if transaction ID is already used - CRITICAL FIX"""
+    result = supabase.table('tokens').select('transaction_id').eq('transaction_id', transaction_id).execute()
+    return len(result.data) > 0 if result.data else False
+
 def verify_transaction(transaction_id, expected_amount):
-    """Verify transaction via API"""
+    """Verify transaction via API - WITH REUSE PREVENTION"""
+    # FIRST: Check if transaction ID already used
+    if is_transaction_used(transaction_id):
+        return {
+            'status': 'FAILED',
+            'message': '❌ This Transaction ID has already been used!'
+        }
+    
     settings = get_bot_settings()
     
     if not settings or not settings.get('api_token'):
@@ -195,9 +207,8 @@ async def check_channel_membership(update: Update, context: ContextTypes.DEFAULT
     user_id = update.effective_user.id
     channel = settings['force_channel'].strip()
     
-    # Remove @ if present in channel ID (IDs should not have @)
     if channel.startswith('@-'):
-        channel = channel[1:]  # Remove the @ from @-100...
+        channel = channel[1:]
     
     try:
         member = await context.bot.get_chat_member(channel, user_id)
@@ -219,16 +230,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command handler"""
     user = update.effective_user
     
-    # Save user to database
     save_user(user.id, user.username, user.first_name, user.last_name)
     
-    # Check if first time user
     existing = supabase.table('users').select('*').eq('user_id', user.id).execute()
     if not existing.data or len(existing.data) == 0:
-        # Notify admins about new user
         await notify_admins_new_user(context, user.id, user.username, user.first_name)
     
-    # Check channel membership
     settings = get_bot_settings()
     
     if settings and settings.get('force_channel'):
@@ -237,7 +244,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_member:
             channel = settings['force_channel']
             
-            # Handle both username and ID formats
             if channel.startswith('@'):
                 channel_username = channel.replace('@', '')
                 join_url = f"https://t.me/{channel_username}"
@@ -334,7 +340,7 @@ async def receive_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if key:
         await update.message.reply_text(
             f"✅ *Key Generated Successfully!*\n\n"
-            f"🔐 Your Key:\n`{key}`\n\n"
+            f"🔑 Your Key:\n`{key}`\n\n"
             f"⚠️ Keep this key safe!",
             parse_mode='Markdown'
         )
@@ -375,7 +381,7 @@ async def buy_package_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 async def select_package_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Package selection callback - SIMPLIFIED FLOW"""
+    """Package selection callback"""
     query = update.callback_query
     await query.answer()
     
@@ -407,7 +413,6 @@ async def select_package_callback(update: Update, context: ContextTypes.DEFAULT_
     img.save(bio, 'PNG')
     bio.seek(0)
     
-    # Send QR code without deep link button (Telegram doesn't support upi://)
     keyboard = [
         [InlineKeyboardButton("« Back", callback_data="buy_package")]
     ]
@@ -466,7 +471,7 @@ async def receive_payment_proof(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 async def handle_transaction_id_submission(update, context, user_id, username, package_id, package):
-    """Handle automatic transaction ID verification"""
+    """Handle automatic transaction ID verification - WITH REUSE PREVENTION"""
     txn_id = update.message.text.strip()
     
     await update.message.reply_text("⏳ Verifying transaction...")
@@ -498,7 +503,7 @@ async def handle_transaction_id_submission(update, context, user_id, username, p
             f"📱 App: {result['app']}\n\n"
             f"📦 Package: {package['plan_name']}\n"
             f"⏱ Validity: {package['validity']} days\n\n"
-            f"🔐 *Your Key:*\n`{key}`\n\n"
+            f"🔑 *Your Key:*\n`{key}`\n\n"
             f"⚠️ Keep this key safe!",
             parse_mode='Markdown'
         )
@@ -534,14 +539,23 @@ async def handle_screenshot_submission(update, context, user_id, username, packa
         parse_mode='Markdown'
     )
     
+    # Get the pending transaction ID that was just created
+    pending_result = supabase.table('pending_transactions').select('id').eq('user_id', user_id).eq('package_id', package_id).eq('status', 'pending').order('created_at', desc=True).limit(1).execute()
+    
+    if not pending_result.data:
+        logger.error("Failed to get pending transaction ID")
+        return
+    
+    pending_id = pending_result.data[0]['id']
+    
     # Notify all admins
     admins = get_all_admins()
     
     for admin_id in admins:
         try:
             keyboard = [
-                [InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user_id}_{package_id}_{file_id}")],
-                [InlineKeyboardButton("❌ Reject", callback_data=f"reject_{user_id}_{package_id}_{file_id}")]
+                [InlineKeyboardButton("✅ Approve", callback_data=f"approve_{pending_id}")],
+                [InlineKeyboardButton("❌ Reject", callback_data=f"reject_{pending_id}")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
