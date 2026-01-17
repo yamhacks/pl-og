@@ -1,0 +1,586 @@
+import os
+import qrcode
+import io
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, 
+    MessageHandler, filters, ContextTypes, ConversationHandler
+)
+from supabase import create_client, Client
+import requests
+import logging
+from datetime import datetime
+import secrets
+
+# Logging setup
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Configuration
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+SUPABASE_URL = os.getenv('SUPABASE_URL')
+SUPABASE_KEY = os.getenv('SUPABASE_KEY')
+
+# Supabase client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Conversation states
+WAITING_TOKEN, WAITING_SCREENSHOT, WAITING_TXN_ID = range(3)
+
+# Helper functions
+def get_bot_settings():
+    """Get bot settings from database"""
+    result = supabase.table('bot_settings').select('*').limit(1).execute()
+    if result.data:
+        return result.data[0]
+    return None
+
+def get_all_admins():
+    """Get all admin IDs"""
+    result = supabase.table('admins').select('telegram_id').eq('is_active', True).execute()
+    return [admin['telegram_id'] for admin in result.data] if result.data else []
+
+def is_admin(user_id):
+    """Check if user is admin"""
+    return user_id in get_all_admins()
+
+def get_upi_details():
+    """Get active UPI details"""
+    result = supabase.table('upi_config').select('*').eq('is_active', True).limit(1).execute()
+    if result.data:
+        return result.data[0]
+    return None
+
+def get_all_packages():
+    """Get all active packages"""
+    result = supabase.table('packages').select('*').eq('is_active', True).order('amount').execute()
+    return result.data
+
+def get_package_by_id(package_id):
+    """Get specific package"""
+    result = supabase.table('packages').select('*').eq('id', package_id).execute()
+    if result.data:
+        return result.data[0]
+    return None
+
+def save_user(user_id, username, first_name, last_name=None):
+    """Save or update user in database"""
+    data = {
+        'user_id': user_id,
+        'username': username,
+        'first_name': first_name,
+        'last_name': last_name,
+        'last_interaction': datetime.utcnow().isoformat()
+    }
+    
+    # Check if user exists
+    existing = supabase.table('users').select('*').eq('user_id', user_id).execute()
+    
+    if existing.data:
+        supabase.table('users').update(data).eq('user_id', user_id).execute()
+    else:
+        supabase.table('users').insert(data).execute()
+
+def notify_admins_new_user(context, user_id, username, first_name):
+    """Notify all admins about new user"""
+    admins = get_all_admins()
+    message = (
+        f"🆕 *New User Started Bot*\n\n"
+        f"👤 Name: {first_name}\n"
+        f"🆔 User ID: `{user_id}`\n"
+        f"📱 Username: @{username if username else 'N/A'}\n"
+        f"🕐 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    
+    for admin_id in admins:
+        try:
+            context.bot.send_message(
+                chat_id=admin_id,
+                text=message,
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify admin {admin_id}: {e}")
+
+def save_pending_transaction(user_id, username, package_id, screenshot_file_id=None):
+    """Save pending transaction"""
+    data = {
+        'user_id': user_id,
+        'username': username,
+        'package_id': package_id,
+        'screenshot_file_id': screenshot_file_id,
+        'status': 'pending',
+        'created_at': datetime.utcnow().isoformat()
+    }
+    result = supabase.table('pending_transactions').insert(data).execute()
+    return result.data[0] if result.data else None
+
+def generate_token_id():
+    """Generate unique token ID"""
+    return secrets.token_hex(16)
+
+def save_token(user_id, username, package_id, transaction_id, amount):
+    """Save token to database"""
+    token_id = generate_token_id()
+    data = {
+        'token_id': token_id,
+        'user_id': user_id,
+        'username': username,
+        'package_id': package_id,
+        'transaction_id': transaction_id,
+        'amount': amount,
+        'status': 'active',
+        'created_at': datetime.utcnow().isoformat()
+    }
+    result = supabase.table('tokens').insert(data).execute()
+    return token_id if result.data else None
+
+def generate_key(token_id, user_id):
+    """Generate key from token"""
+    result = supabase.table('tokens').select('*').eq('token_id', token_id).eq('user_id', user_id).eq('status', 'active').execute()
+    
+    if not result.data:
+        return None
+    
+    token_data = result.data[0]
+    package = get_package_by_id(token_data['package_id'])
+    
+    if not package:
+        return None
+    
+    key = secrets.token_urlsafe(32)
+    
+    key_data = {
+        'key': key,
+        'user_id': user_id,
+        'package_id': token_data['package_id'],
+        'token_id': token_id,
+        'validity_days': package['validity'],
+        'created_at': datetime.utcnow().isoformat(),
+        'status': 'active'
+    }
+    supabase.table('keys').insert(key_data).execute()
+    supabase.table('tokens').update({'status': 'used'}).eq('token_id', token_id).execute()
+    
+    return key
+
+def verify_transaction(transaction_id, expected_amount):
+    """Verify transaction via API"""
+    settings = get_bot_settings()
+    
+    if not settings or not settings.get('api_token'):
+        return {'status': 'ERROR', 'message': 'API configuration not found'}
+    
+    api_token = settings['api_token']
+    url = f"https://api.intechost.com/bharatpe/api.php?token={api_token}&txn_id={transaction_id}"
+    
+    try:
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        
+        if data.get('status') == 'SUCCESS' and float(data.get('amount', 0)) == float(expected_amount):
+            return {
+                'status': 'SUCCESS',
+                'amount': data.get('amount'),
+                'payer': data.get('payer'),
+                'app': data.get('app')
+            }
+        else:
+            return {
+                'status': 'FAILED',
+                'message': f"Verification failed. Status: {data.get('status')}, Amount: {data.get('amount')}"
+            }
+    except Exception as e:
+        logger.error(f"API error: {e}")
+        return {'status': 'ERROR', 'message': str(e)}
+
+# Bot handlers
+async def check_channel_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check if user is member of required channel"""
+    settings = get_bot_settings()
+    
+    if not settings or not settings.get('force_channel'):
+        return True
+    
+    user_id = update.effective_user.id
+    channel = settings['force_channel']
+    
+    try:
+        member = await context.bot.get_chat_member(channel, user_id)
+        return member.status in ['member', 'administrator', 'creator']
+    except Exception as e:
+        logger.error(f"Channel check error: {e}")
+        return False
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start command handler"""
+    user = update.effective_user
+    
+    # Save user to database
+    save_user(user.id, user.username, user.first_name, user.last_name)
+    
+    # Check if first time user
+    existing = supabase.table('users').select('*').eq('user_id', user.id).execute()
+    if not existing.data or len(existing.data) == 0:
+        # Notify admins about new user
+        await notify_admins_new_user(context, user.id, user.username, user.first_name)
+    
+    # Check channel membership
+    settings = get_bot_settings()
+    
+    if settings and settings.get('force_channel'):
+        is_member = await check_channel_membership(update, context)
+        
+        if not is_member:
+            channel_username = settings['force_channel'].replace('@', '')
+            keyboard = [
+                [InlineKeyboardButton("Join Channel 🔗", url=f"https://t.me/{channel_username}")],
+                [InlineKeyboardButton("Verify ✅", callback_data="verify_membership")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                f"🚫 *Access Denied!*\n\n"
+                f"Please join our channel first.\n\n"
+                f"After joining, click 'Verify' button.",
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+            return
+    
+    await show_main_menu(update, context)
+
+async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Verify button callback"""
+    query = update.callback_query
+    await query.answer()
+    
+    is_member = await check_channel_membership(update, context)
+    
+    if not is_member:
+        await query.message.reply_text(
+            "❌ You are not a member yet.\n"
+            "Please join the channel first, then verify."
+        )
+        return
+    
+    await query.message.reply_text("✅ Verification successful!")
+    await show_main_menu(update, context)
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show main menu"""
+    keyboard = [
+        [InlineKeyboardButton("🔑 Generate Key", callback_data="generate_key")],
+        [InlineKeyboardButton("💳 Buy Package", callback_data="buy_package")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    text = (
+        "🎯 *Welcome to Key Generator Bot!*\n\n"
+        "What would you like to do?\n\n"
+        "• *Generate Key* - Generate key using token\n"
+        "• *Buy Package* - Purchase new package"
+    )
+    
+    if update.callback_query:
+        await update.callback_query.message.edit_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+
+async def generate_key_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate key callback"""
+    query = update.callback_query
+    await query.answer()
+    
+    await query.message.reply_text(
+        "🔑 *Generate Key*\n\n"
+        "Please enter your Token ID:",
+        parse_mode='Markdown'
+    )
+    
+    return WAITING_TOKEN
+
+async def receive_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive token and generate key"""
+    token_id = update.message.text.strip()
+    user_id = update.effective_user.id
+    
+    key = generate_key(token_id, user_id)
+    
+    if key:
+        await update.message.reply_text(
+            f"✅ *Key Generated Successfully!*\n\n"
+            f"🔐 Your Key:\n`{key}`\n\n"
+            f"⚠️ Keep this key safe!",
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Invalid token or token already used.\n"
+            "Please check and try again."
+        )
+    
+    return ConversationHandler.END
+
+async def buy_package_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Buy package callback"""
+    query = update.callback_query
+    await query.answer()
+    
+    packages = get_all_packages()
+    
+    if not packages:
+        await query.message.reply_text("❌ No packages available at the moment.")
+        return
+    
+    keyboard = []
+    for pkg in packages:
+        keyboard.append([InlineKeyboardButton(
+            f"{pkg['plan_name']} - ₹{pkg['amount']} ({pkg['validity']} days)",
+            callback_data=f"select_pkg_{pkg['id']}"
+        )])
+    
+    keyboard.append([InlineKeyboardButton("« Back", callback_data="back_to_menu")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.message.edit_text(
+        "💳 *Available Packages*\n\nSelect a package:",
+        parse_mode='Markdown',
+        reply_markup=reply_markup
+    )
+
+async def select_package_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Package selection callback"""
+    query = update.callback_query
+    await query.answer()
+    
+    package_id = int(query.data.split('_')[2])
+    package = get_package_by_id(package_id)
+    
+    if not package:
+        await query.message.reply_text("❌ Package not found!")
+        return
+    
+    context.user_data['selected_package'] = package
+    
+    upi_details = get_upi_details()
+    
+    if not upi_details:
+        await query.message.reply_text("❌ Payment method not configured!")
+        return
+    
+    # Generate QR code
+    upi_string = f"upi://pay?pa={upi_details['upi_id']}&pn={upi_details['name']}&am={package['amount']}&cu=INR"
+    
+    qr = qrcode.QRCode(version=1, box_size=10, border=5)
+    qr.add_data(upi_string)
+    qr.make(fit=True)
+    
+    img = qr.make_image(fill_color="black", back_color="white")
+    
+    bio = io.BytesIO()
+    img.save(bio, 'PNG')
+    bio.seek(0)
+    
+    await query.message.reply_photo(
+        photo=InputFile(bio, filename='qr.png'),
+        caption=(
+            f"📦 *{package['plan_name']}*\n\n"
+            f"💰 Amount: ₹{package['amount']}\n"
+            f"⏱ Validity: {package['validity']} days\n"
+            f"📝 Description: {package['description']}\n\n"
+            f"💳 UPI ID: `{upi_details['upi_id']}`\n\n"
+            f"Scan QR code or pay using UPI ID."
+        ),
+        parse_mode='Markdown'
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("💳 Pay Now", url=upi_string)],
+        [InlineKeyboardButton("✅ Submit Transaction ID", callback_data=f"submit_txn_{package_id}")],
+        [InlineKeyboardButton("📸 Submit Screenshot", callback_data=f"submit_ss_{package_id}")],
+        [InlineKeyboardButton("« Back", callback_data="buy_package")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.message.reply_text(
+        "Select an option:",
+        reply_markup=reply_markup
+    )
+
+async def submit_transaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Submit transaction ID"""
+    query = update.callback_query
+    await query.answer()
+    
+    package_id = int(query.data.split('_')[2])
+    context.user_data['pending_package_id'] = package_id
+    
+    await query.message.reply_text(
+        "🔢 *Submit Transaction ID*\n\n"
+        "Please enter your UTR/Transaction ID:",
+        parse_mode='Markdown'
+    )
+    
+    return WAITING_TXN_ID
+
+async def receive_transaction_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive and verify transaction ID"""
+    txn_id = update.message.text.strip()
+    user_id = update.effective_user.id
+    username = update.effective_user.username or "Unknown"
+    package_id = context.user_data.get('pending_package_id')
+    
+    if not package_id:
+        await update.message.reply_text("❌ Error: Package not found!")
+        return ConversationHandler.END
+    
+    package = get_package_by_id(package_id)
+    
+    await update.message.reply_text("⏳ Verifying transaction...")
+    
+    result = verify_transaction(txn_id, package['amount'])
+    
+    if result['status'] == 'SUCCESS':
+        token_id = save_token(user_id, username, package_id, txn_id, package['amount'])
+        
+        keyboard = [[InlineKeyboardButton("🔑 Generate Key Now", callback_data="generate_key")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            f"✅ *Transaction Verified!*\n\n"
+            f"💰 Amount: ₹{result['amount']}\n"
+            f"👤 Payer: {result['payer']}\n"
+            f"📱 App: {result['app']}\n\n"
+            f"🎟 Your Token ID:\n`{token_id}`\n\n"
+            f"You can now generate your key!",
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ *Verification Failed!*\n\n"
+            f"{result.get('message', 'Unknown error')}\n\n"
+            f"Please check and try again.",
+            parse_mode='Markdown'
+        )
+    
+    return ConversationHandler.END
+
+async def submit_screenshot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Submit screenshot"""
+    query = update.callback_query
+    await query.answer()
+    
+    package_id = int(query.data.split('_')[2])
+    context.user_data['pending_package_id'] = package_id
+    
+    await query.message.reply_text(
+        "📸 *Submit Screenshot*\n\n"
+        "Please upload payment screenshot.\n"
+        "⏱ Review time: 1-2 hours",
+        parse_mode='Markdown'
+    )
+    
+    return WAITING_SCREENSHOT
+
+async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive screenshot"""
+    user_id = update.effective_user.id
+    username = update.effective_user.username or "Unknown"
+    package_id = context.user_data.get('pending_package_id')
+    
+    if not update.message.photo:
+        await update.message.reply_text("❌ Please send screenshot image!")
+        return WAITING_SCREENSHOT
+    
+    photo = update.message.photo[-1]
+    file_id = photo.file_id
+    
+    save_pending_transaction(user_id, username, package_id, file_id)
+    
+    await update.message.reply_text(
+        "✅ *Screenshot Received!*\n\n"
+        "Your request has been sent to admin for review.\n"
+        "⏱ Review time: 1-2 hours\n\n"
+        "You will receive your key once approved.",
+        parse_mode='Markdown'
+    )
+    
+    # Notify all admins
+    admins = get_all_admins()
+    package = get_package_by_id(package_id)
+    
+    keyboard = [[InlineKeyboardButton("Approve ✅", callback_data=f"approve_{user_id}_{package_id}_{file_id}")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    for admin_id in admins:
+        try:
+            await context.bot.send_photo(
+                chat_id=admin_id,
+                photo=file_id,
+                caption=(
+                    f"🔔 *New Payment Screenshot*\n\n"
+                    f"👤 User: @{username}\n"
+                    f"🆔 User ID: `{user_id}`\n"
+                    f"📦 Package: {package['plan_name']}\n"
+                    f"💰 Amount: ₹{package['amount']}"
+                ),
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify admin {admin_id}: {e}")
+    
+    return ConversationHandler.END
+
+async def back_to_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Back to main menu"""
+    query = update.callback_query
+    await query.answer()
+    await show_main_menu(update, context)
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel conversation"""
+    await update.message.reply_text("❌ Cancelled!")
+    return ConversationHandler.END
+
+def main():
+    """Start bot"""
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(generate_key_callback, pattern="^generate_key$"),
+            CallbackQueryHandler(submit_transaction_callback, pattern="^submit_txn_"),
+            CallbackQueryHandler(submit_screenshot_callback, pattern="^submit_ss_")
+        ],
+        states={
+            WAITING_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_token)],
+            WAITING_TXN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_transaction_id)],
+            WAITING_SCREENSHOT: [MessageHandler(filters.PHOTO, receive_screenshot)]
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    )
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(verify_callback, pattern="^verify_membership$"))
+    application.add_handler(CallbackQueryHandler(buy_package_callback, pattern="^buy_package$"))
+    application.add_handler(CallbackQueryHandler(select_package_callback, pattern="^select_pkg_"))
+    application.add_handler(CallbackQueryHandler(back_to_menu_callback, pattern="^back_to_menu$"))
+    application.add_handler(conv_handler)
+    
+    # Import and add admin handlers
+    from admin_commands import get_admin_handlers
+    for handler in get_admin_handlers():
+        application.add_handler(handler)
+    
+    logger.info("Bot starting...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
