@@ -783,7 +783,12 @@ async def admin_edit_channel_save(update: Update, context: ContextTypes.DEFAULT_
     """Save channel"""
     channel = update.message.text.strip()
     
-    if not channel.startswith('@') and not channel.startswith('-100'):
+    # Handle channel ID vs username
+    if channel.startswith('-100'):
+        # It's a channel ID, don't add @
+        channel = channel
+    elif not channel.startswith('@'):
+        # It's a username without @, add it
         channel = '@' + channel
     
     settings = supabase.table('bot_settings').select('*').limit(1).execute().data
@@ -793,8 +798,13 @@ async def admin_edit_channel_save(update: Update, context: ContextTypes.DEFAULT_
     else:
         supabase.table('bot_settings').insert({'force_channel': channel}).execute()
     
+    channel_type = "Channel ID" if channel.startswith('-') else "Channel Username"
+    
     await update.message.reply_text(
-        f"✅ *Channel Updated!*\n\n📢 New channel: {channel}",
+        f"✅ *Channel Updated!*\n\n"
+        f"📢 Type: {channel_type}\n"
+        f"📢 Value: `{channel}`\n\n"
+        f"⚠️ Make sure bot is added as ADMIN in the channel!",
         parse_mode='Markdown'
     )
     
