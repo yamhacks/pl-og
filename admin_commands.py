@@ -1,6 +1,6 @@
 """
 Admin Commands Module
-Complete admin panel for bot management
+Complete admin panel for bot management with Limited Admin support
 """
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -9,6 +9,7 @@ from supabase import create_client, Client
 import os
 import secrets
 from datetime import datetime
+import requests
 
 SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY')
@@ -16,9 +17,9 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Conversation states for admin
 (ADMIN_WAITING_USERNAME, ADMIN_WAITING_PACKAGE, ADMIN_WAITING_TXN,
- ADMIN_ADD_UPI_ID, ADMIN_ADD_UPI_NAME, ADMIN_ADD_ADMIN_ID,
+ ADMIN_ADD_UPI_ID, ADMIN_ADD_UPI_NAME, ADMIN_ADD_ADMIN_ID, ADMIN_ADD_ADMIN_ROLE,
  ADMIN_ADD_PKG_NAME, ADMIN_ADD_PKG_DESC, ADMIN_ADD_PKG_AMOUNT, ADMIN_ADD_PKG_VALIDITY,
- ADMIN_EDIT_CHANNEL, ADMIN_EDIT_API) = range(20, 32)
+ ADMIN_EDIT_CHANNEL, ADMIN_EDIT_API) = range(20, 33)
 
 def get_all_admins():
     """Get all admin IDs"""
@@ -29,6 +30,46 @@ def is_admin(user_id):
     """Check if user is admin"""
     return user_id in get_all_admins()
 
+def get_admin_role(user_id):
+    """Get admin role - returns 'super' or 'limited'"""
+    result = supabase.table('admins').select('role').eq('telegram_id', user_id).eq('is_active', True).execute()
+    if result.data:
+        return result.data[0].get('role', 'limited')
+    return None
+
+def is_super_admin(user_id):
+    """Check if user is super admin"""
+    return get_admin_role(user_id) == 'super'
+
+def verify_transaction(transaction_id, expected_amount):
+    """Verify transaction via API"""
+    settings = supabase.table('bot_settings').select('*').limit(1).execute().data
+    
+    if not settings or not settings[0].get('api_token'):
+        return {'status': 'ERROR', 'message': 'API configuration not found'}
+    
+    api_token = settings[0]['api_token']
+    url = f"https://api.intechost.com/bharatpe/api.php?token={api_token}&txn_id={transaction_id}"
+    
+    try:
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        
+        if data.get('status') == 'SUCCESS' and float(data.get('amount', 0)) == float(expected_amount):
+            return {
+                'status': 'SUCCESS',
+                'amount': data.get('amount'),
+                'payer': data.get('payer'),
+                'app': data.get('app')
+            }
+        else:
+            return {
+                'status': 'FAILED',
+                'message': f"Verification failed. Status: {data.get('status')}, Amount: {data.get('amount')}"
+            }
+    except Exception as e:
+        return {'status': 'ERROR', 'message': str(e)}
+
 # === ADMIN PANEL ===
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Main admin panel"""
@@ -38,24 +79,42 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Unauthorized! Admin access only.")
         return
     
-    keyboard = [
-        [InlineKeyboardButton("➕ Generate Token Manually", callback_data="admin_gen_token")],
-        [InlineKeyboardButton("📋 View Pending Reviews", callback_data="admin_pending")],
-        [InlineKeyboardButton("📦 Manage Packages", callback_data="admin_packages")],
-        [InlineKeyboardButton("💳 Manage UPI", callback_data="admin_upi")],
-        [InlineKeyboardButton("👥 Manage Admins", callback_data="admin_admins")],
-        [InlineKeyboardButton("⚙️ Bot Settings", callback_data="admin_settings")],
-        [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    role = get_admin_role(user_id)
     
-    await update.message.reply_text(
-        "🔐 *Admin Panel*\n\nSelect an option:",
-        parse_mode='Markdown',
-        reply_markup=reply_markup
-    )
+    if role == 'limited':
+        # Limited admin menu
+        keyboard = [
+            [InlineKeyboardButton("➕ Generate Token Manually", callback_data="admin_gen_token")],
+            [InlineKeyboardButton("📋 View Pending Reviews", callback_data="admin_pending")],
+            [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "🔐 *Limited Admin Panel*\n\nSelect an option:",
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+    else:
+        # Super admin menu
+        keyboard = [
+            [InlineKeyboardButton("➕ Generate Token Manually", callback_data="admin_gen_token")],
+            [InlineKeyboardButton("📋 View Pending Reviews", callback_data="admin_pending")],
+            [InlineKeyboardButton("📦 Manage Packages", callback_data="admin_packages")],
+            [InlineKeyboardButton("💳 Manage UPI", callback_data="admin_upi")],
+            [InlineKeyboardButton("👥 Manage Admins", callback_data="admin_admins")],
+            [InlineKeyboardButton("⚙️ Bot Settings", callback_data="admin_settings")],
+            [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "🔑 *Super Admin Panel*\n\nSelect an option:",
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
 
-# === MANUAL TOKEN GENERATION ===
+# === MANUAL TOKEN GENERATION (WITH TRANSACTION VERIFICATION) ===
 async def admin_generate_token_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start manual token generation"""
     query = update.callback_query
@@ -114,48 +173,63 @@ async def admin_select_package(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.message.reply_text(
         f"📦 Package: {package['plan_name']}\n"
         f"💰 Amount: ₹{package['amount']}\n\n"
-        f"🔢 Enter Transaction ID:",
+        f"🔢 Enter Transaction ID for verification:",
         parse_mode='Markdown'
     )
     
     return ADMIN_WAITING_TXN
 
 async def admin_receive_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive transaction and generate token"""
+    """Receive transaction and verify before generating token"""
     txn_id = update.message.text.strip()
     username = context.user_data.get('admin_target_username')
     package_id = context.user_data.get('admin_package_id')
     
     package = supabase.table('packages').select('*').eq('id', package_id).execute().data[0]
     
-    token_id = secrets.token_hex(16)
+    await update.message.reply_text("⏳ Verifying transaction...")
     
-    data = {
-        'token_id': token_id,
-        'user_id': 0,
-        'username': username,
-        'package_id': package_id,
-        'transaction_id': txn_id,
-        'amount': package['amount'],
-        'status': 'active',
-        'created_at': datetime.utcnow().isoformat()
-    }
+    # Verify transaction
+    result = verify_transaction(txn_id, package['amount'])
     
-    result = supabase.table('tokens').insert(data).execute()
-    
-    if result.data:
+    if result['status'] == 'SUCCESS':
+        # Generate token after successful verification
+        token_id = secrets.token_hex(16)
+        
+        data = {
+            'token_id': token_id,
+            'user_id': 0,
+            'username': username,
+            'package_id': package_id,
+            'transaction_id': txn_id,
+            'amount': package['amount'],
+            'status': 'active',
+            'created_at': datetime.utcnow().isoformat()
+        }
+        
+        supabase.table('tokens').insert(data).execute()
+        
         await update.message.reply_text(
             f"✅ *Token Generated Successfully!*\n\n"
             f"👤 Username: @{username}\n"
             f"📦 Package: {package['plan_name']}\n"
             f"💰 Amount: ₹{package['amount']}\n"
             f"🔢 Transaction ID: {txn_id}\n\n"
+            f"✅ Verified Details:\n"
+            f"💵 Paid: ₹{result['amount']}\n"
+            f"👤 Payer: {result['payer']}\n"
+            f"📱 App: {result['app']}\n\n"
             f"🎟 *Token ID:*\n`{token_id}`\n\n"
             f"Share this token with the user.",
             parse_mode='Markdown'
         )
     else:
-        await update.message.reply_text("❌ Error generating token!")
+        await update.message.reply_text(
+            f"❌ *Transaction Verification Failed!*\n\n"
+            f"{result.get('message', 'Unknown error')}\n\n"
+            f"Token NOT generated. Please verify the transaction ID.",
+            parse_mode='Markdown'
+        )
     
     return ConversationHandler.END
 
@@ -304,11 +378,15 @@ async def admin_reject_screenshot(update: Update, context: ContextTypes.DEFAULT_
         parse_mode='Markdown'
     )
 
-# === PACKAGE MANAGEMENT ===
+# === PACKAGE MANAGEMENT (SUPER ADMIN ONLY) ===
 async def admin_packages_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Packages management menu"""
     query = update.callback_query
     await query.answer()
+    
+    if not is_super_admin(update.effective_user.id):
+        await query.message.reply_text("❌ Unauthorized! Super admin access only.")
+        return
     
     keyboard = [
         [InlineKeyboardButton("➕ Add Package", callback_data="admin_add_package")],
@@ -352,6 +430,10 @@ async def admin_add_package_start(update: Update, context: ContextTypes.DEFAULT_
     """Start adding package"""
     query = update.callback_query
     await query.answer()
+    
+    if not is_super_admin(update.effective_user.id):
+        await query.message.reply_text("❌ Unauthorized!")
+        return ConversationHandler.END
     
     await query.message.reply_text(
         "➕ *Add New Package*\n\nEnter package name:",
@@ -418,11 +500,15 @@ async def admin_add_package_validity(update: Update, context: ContextTypes.DEFAU
         await update.message.reply_text("❌ Invalid validity! Please enter a number:")
         return ADMIN_ADD_PKG_VALIDITY
 
-# === UPI MANAGEMENT ===
+# === UPI MANAGEMENT (SUPER ADMIN ONLY) ===
 async def admin_upi_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """UPI management menu"""
     query = update.callback_query
     await query.answer()
+    
+    if not is_super_admin(update.effective_user.id):
+        await query.message.reply_text("❌ Unauthorized! Super admin access only.")
+        return
     
     keyboard = [
         [InlineKeyboardButton("➕ Add UPI", callback_data="admin_add_upi")],
@@ -467,6 +553,10 @@ async def admin_add_upi_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
     
+    if not is_super_admin(update.effective_user.id):
+        await query.message.reply_text("❌ Unauthorized!")
+        return ConversationHandler.END
+    
     await query.message.reply_text(
         "➕ *Add UPI Details*\n\nEnter UPI ID:",
         parse_mode='Markdown'
@@ -509,11 +599,15 @@ async def admin_add_upi_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     return ConversationHandler.END
 
-# === ADMIN MANAGEMENT ===
+# === ADMIN MANAGEMENT (SUPER ADMIN ONLY) ===
 async def admin_admins_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admins management menu"""
     query = update.callback_query
     await query.answer()
+    
+    if not is_super_admin(update.effective_user.id):
+        await query.message.reply_text("❌ Unauthorized! Super admin access only.")
+        return
     
     keyboard = [
         [InlineKeyboardButton("➕ Add Admin", callback_data="admin_add_admin")],
@@ -542,7 +636,8 @@ async def admin_view_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "👥 *All Admins:*\n\n"
     for admin in admins:
         status = "✅" if admin['is_active'] else "❌"
-        text += f"{status} ID: `{admin['telegram_id']}` | {admin.get('name', 'N/A')}\n"
+        role = admin.get('role', 'limited').upper()
+        text += f"{status} ID: `{admin['telegram_id']}` | Role: {role}\n"
     
     keyboard = [[InlineKeyboardButton("« Back", callback_data="admin_admins")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -554,6 +649,10 @@ async def admin_add_admin_start(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     
+    if not is_super_admin(update.effective_user.id):
+        await query.message.reply_text("❌ Unauthorized!")
+        return ConversationHandler.END
+    
     await query.message.reply_text(
         "➕ *Add New Admin*\n\nEnter Telegram User ID:",
         parse_mode='Markdown'
@@ -562,37 +661,69 @@ async def admin_add_admin_start(update: Update, context: ContextTypes.DEFAULT_TY
     return ADMIN_ADD_ADMIN_ID
 
 async def admin_add_admin_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive admin ID and save"""
+    """Receive admin ID and ask for role"""
     try:
         admin_id = int(update.message.text.strip())
+        context.user_data['new_admin_id'] = admin_id
         
-        data = {
-            'telegram_id': admin_id,
-            'is_active': True,
-            'created_at': datetime.utcnow().isoformat()
-        }
+        keyboard = [
+            [InlineKeyboardButton("🔑 Super Admin", callback_data="role_super")],
+            [InlineKeyboardButton("🔐 Limited Admin", callback_data="role_limited")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
         
-        result = supabase.table('admins').insert(data).execute()
+        await update.message.reply_text(
+            f"Select admin role:\n\n"
+            f"🔑 *Super Admin* - Full access\n"
+            f"🔐 *Limited Admin* - Only generate tokens & review",
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
         
-        if result.data:
-            await update.message.reply_text(
-                f"✅ *Admin Added Successfully!*\n\n"
-                f"🆔 User ID: `{admin_id}`",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.message.reply_text("❌ Error adding admin!")
-        
-        return ConversationHandler.END
+        return ADMIN_ADD_ADMIN_ROLE
     except:
         await update.message.reply_text("❌ Invalid User ID! Please enter a number:")
         return ADMIN_ADD_ADMIN_ID
 
-# === BOT SETTINGS ===
+async def admin_add_admin_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive role and save admin"""
+    query = update.callback_query
+    await query.answer()
+    
+    role = query.data.split('_')[1]  # 'super' or 'limited'
+    admin_id = context.user_data.get('new_admin_id')
+    
+    data = {
+        'telegram_id': admin_id,
+        'role': role,
+        'is_active': True,
+        'created_at': datetime.utcnow().isoformat()
+    }
+    
+    result = supabase.table('admins').insert(data).execute()
+    
+    if result.data:
+        role_name = "Super Admin" if role == 'super' else "Limited Admin"
+        await query.message.reply_text(
+            f"✅ *Admin Added Successfully!*\n\n"
+            f"🆔 User ID: `{admin_id}`\n"
+            f"👤 Role: {role_name}",
+            parse_mode='Markdown'
+        )
+    else:
+        await query.message.reply_text("❌ Error adding admin!")
+    
+    return ConversationHandler.END
+
+# === BOT SETTINGS (SUPER ADMIN ONLY) ===
 async def admin_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Bot settings menu"""
     query = update.callback_query
     await query.answer()
+    
+    if not is_super_admin(update.effective_user.id):
+        await query.message.reply_text("❌ Unauthorized! Super admin access only.")
+        return
     
     keyboard = [
         [InlineKeyboardButton("📢 Edit Force Channel", callback_data="admin_edit_channel")],
@@ -636,9 +767,13 @@ async def admin_edit_channel_start(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
     
+    if not is_super_admin(update.effective_user.id):
+        await query.message.reply_text("❌ Unauthorized!")
+        return ConversationHandler.END
+    
     await query.message.reply_text(
         "📢 *Edit Force Channel*\n\n"
-        "Enter channel username (with @):",
+        "Enter channel username (with @) or channel ID:",
         parse_mode='Markdown'
     )
     
@@ -648,7 +783,7 @@ async def admin_edit_channel_save(update: Update, context: ContextTypes.DEFAULT_
     """Save channel"""
     channel = update.message.text.strip()
     
-    if not channel.startswith('@'):
+    if not channel.startswith('@') and not channel.startswith('-100'):
         channel = '@' + channel
     
     settings = supabase.table('bot_settings').select('*').limit(1).execute().data
@@ -669,6 +804,10 @@ async def admin_edit_api_start(update: Update, context: ContextTypes.DEFAULT_TYP
     """Start editing API token"""
     query = update.callback_query
     await query.answer()
+    
+    if not is_super_admin(update.effective_user.id):
+        await query.message.reply_text("❌ Unauthorized!")
+        return ConversationHandler.END
     
     await query.message.reply_text(
         "🔑 *Edit API Token*\n\n"
@@ -728,22 +867,41 @@ async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    keyboard = [
-        [InlineKeyboardButton("➕ Generate Token Manually", callback_data="admin_gen_token")],
-        [InlineKeyboardButton("📋 View Pending Reviews", callback_data="admin_pending")],
-        [InlineKeyboardButton("📦 Manage Packages", callback_data="admin_packages")],
-        [InlineKeyboardButton("💳 Manage UPI", callback_data="admin_upi")],
-        [InlineKeyboardButton("👥 Manage Admins", callback_data="admin_admins")],
-        [InlineKeyboardButton("⚙️ Bot Settings", callback_data="admin_settings")],
-        [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    user_id = update.effective_user.id
+    role = get_admin_role(user_id)
     
-    await query.message.edit_text(
-        "🔐 *Admin Panel*\n\nSelect an option:",
-        parse_mode='Markdown',
-        reply_markup=reply_markup
-    )
+    if role == 'limited':
+        # Limited admin menu
+        keyboard = [
+            [InlineKeyboardButton("➕ Generate Token Manually", callback_data="admin_gen_token")],
+            [InlineKeyboardButton("📋 View Pending Reviews", callback_data="admin_pending")],
+            [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.message.edit_text(
+            "🔐 *Limited Admin Panel*\n\nSelect an option:",
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+    else:
+        # Super admin menu
+        keyboard = [
+            [InlineKeyboardButton("➕ Generate Token Manually", callback_data="admin_gen_token")],
+            [InlineKeyboardButton("📋 View Pending Reviews", callback_data="admin_pending")],
+            [InlineKeyboardButton("📦 Manage Packages", callback_data="admin_packages")],
+            [InlineKeyboardButton("💳 Manage UPI", callback_data="admin_upi")],
+            [InlineKeyboardButton("👥 Manage Admins", callback_data="admin_admins")],
+            [InlineKeyboardButton("⚙️ Bot Settings", callback_data="admin_settings")],
+            [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.message.edit_text(
+            "🔑 *Super Admin Panel*\n\nSelect an option:",
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
 
 async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel operation"""
@@ -797,7 +955,8 @@ def get_admin_handlers():
     admin_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_add_admin_start, pattern="^admin_add_admin$")],
         states={
-            ADMIN_ADD_ADMIN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_admin_id)]
+            ADMIN_ADD_ADMIN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_admin_id)],
+            ADMIN_ADD_ADMIN_ROLE: [CallbackQueryHandler(admin_add_admin_role, pattern="^role_")]
         },
         fallbacks=[CallbackQueryHandler(admin_cancel, pattern="^admin_cancel$")]
     )
